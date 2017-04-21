@@ -36,7 +36,6 @@ local pairs = pairs
 local pcall = pcall
 local type = type
 
-
 -- http://www.w3.org/Protocols/rfc2616/rfc2616-sec13.html#sec13.5.1
 local HOP_BY_HOP_HEADERS = {
     ["connection"]          = true,
@@ -152,6 +151,7 @@ function _M.connect(self, ...)
     end
 
     self.keepalive = true
+    self.upgrade = false
 
     return sock:connect(...)
 end
@@ -163,19 +163,26 @@ function _M.set_keepalive(self, ...)
         return nil, "not initialized"
     end
 
+
     if self.keepalive == true then
         return sock:setkeepalive(...)
     else
-        -- The server said we must close the connection, so we cannot setkeepalive.
-        -- If close() succeeds we return 2 instead of 1, to differentiate between
-        -- a normal setkeepalive() failure and an intentional close().
-        local res, err = sock:close()
-        if res then
-            return 2, "connection must be closed"
+        if self.upgrade==false then
+          -- The server said we must close the connection, so we cannot setkeepalive.
+          -- If close() succeeds we return 2 instead of 1, to differentiate between
+          -- a normal setkeepalive() failure and an intentional close().
+          local res, err = sock:close()
+          if res then
+              return 2, "connection must be closed"
+          else
+              return res, err
+          end
         else
-            return res, err
+          return 1, nil --websocket
         end
+        
     end
+    
 end
 
 
@@ -562,6 +569,7 @@ function _M.send_request(self, params)
     setmetatable(params, { __index = DEFAULT_PARAMS })
 
     local sock = self.sock
+        
     local body = params.body
     local headers = http_headers.new()
 
@@ -574,31 +582,39 @@ function _M.send_request(self, params)
         end
     end
 
+    if headers["connection"] and str_lower(headers["connection"])=="upgrade" then
+      self.upgrade=true
+    end
+    
     -- Ensure minimal headers are set
-    if type(body) == 'string' and not headers["Content-Length"] then
-        headers["Content-Length"] = #body
+    if not params.no_default_headers  then
+      if type(body) == 'string' and not headers["Content-Length"] then
+          headers["Content-Length"] = #body
+      end
+      if not headers["Host"] then
+          if (str_sub(self.host, 1, 5) == "unix:") then
+              return nil, "Unable to generate a useful Host header for a unix domain socket. Please provide one."
+          end
+          -- If we have a port (i.e. not connected to a unix domain socket), and this
+          -- port is non-standard, append it to the Host heaer.
+          if self.port then
+              if self.ssl and self.port ~= 443 then
+                  headers["Host"] = self.host .. ":" .. self.port
+              elseif not self.ssl and self.port ~= 80 then
+                  headers["Host"] = self.host .. ":" .. self.port
+              else
+                  headers["Host"] = self.host
+              end
+          else
+              headers["Host"] = self.host
+          end
+      end
+      if not headers["User-Agent"] then
+          headers["User-Agent"] = _M._USER_AGENT
+      end
+    
     end
-    if not headers["Host"] then
-        if (str_sub(self.host, 1, 5) == "unix:") then
-            return nil, "Unable to generate a useful Host header for a unix domain socket. Please provide one."
-        end
-        -- If we have a port (i.e. not connected to a unix domain socket), and this
-        -- port is non-standard, append it to the Host heaer.
-        if self.port then
-            if self.ssl and self.port ~= 443 then
-                headers["Host"] = self.host .. ":" .. self.port
-            elseif not self.ssl and self.port ~= 80 then
-                headers["Host"] = self.host .. ":" .. self.port
-            else
-                headers["Host"] = self.host
-            end
-        else
-            headers["Host"] = self.host
-        end
-    end
-    if not headers["User-Agent"] then
-        headers["User-Agent"] = _M._USER_AGENT
-    end
+    
     if params.version == 1.0 and not headers["Connection"] then
         headers["Connection"] = "Keep-Alive"
     end
@@ -662,8 +678,12 @@ function _M.read_response(self, params)
     if ok then
         if  (version == 1.1 and connection == "close") or
             (version == 1.0 and connection ~= "keep-alive") then
+            --  or str_lower(connection) == "upgrade" then
             self.keepalive = false
         end
+        if str_lower(connection) == "upgrade" then
+          self.upgrade=true
+        end        
     else
         -- no connection header
         if version == 1.0 then
@@ -713,6 +733,7 @@ end
 
 
 function _M.request(self, params)
+    
     local res, err = self:send_request(params)
     if not res then
         return res, err
@@ -844,22 +865,30 @@ function _M.get_client_body_reader(self, chunksize, sock)
     else
        return nil
     end
+
 end
 
 
 function _M.proxy_request(self, chunksize)
-    return self:request{
+    local request, err=self:request{
         method = ngx_req_get_method(),
         path = ngx_re_gsub(ngx_var.uri, "\\s", "%20", "jo") .. ngx_var.is_args .. (ngx_var.query_string or ""),
         body = self:get_client_body_reader(chunksize),
         headers = ngx_req_get_headers(),
     }
+    if err then
+      print("error proxying request: " .. err)
+      --retry?
+    end
+    
+    return request
 end
 
-
 function _M.proxy_response(self, response, chunksize)
+
     if not response then
-        ngx_log(ngx_ERR, "no response provided")
+--        ngx_log(ngx_ERR, "no response provided")
+--        ngx.exit(ngx.HTTP_CLOSE)
         return
     end
 
@@ -868,10 +897,10 @@ function _M.proxy_response(self, response, chunksize)
     -- Filter out hop-by-hop headeres
     for k,v in pairs(response.headers) do
         if not HOP_BY_HOP_HEADERS[str_lower(k)] then
-            ngx.header[k] = v
+            ngx.header[k] = v            
         end
     end
-
+    
     local reader = response.body_reader
     repeat
         local chunk, err = reader(chunksize)
@@ -888,7 +917,9 @@ function _M.proxy_response(self, response, chunksize)
             end
         end
     until not chunk
+    
 end
+
 
 
 return _M
