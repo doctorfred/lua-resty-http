@@ -1,5 +1,6 @@
 local http_headers = require "resty.http_headers"
 
+local ngx = ngx
 local ngx_socket_tcp = ngx.socket.tcp
 local ngx_req = ngx.req
 local ngx_req_socket = ngx_req.socket
@@ -21,6 +22,7 @@ local ngx_DEBUG = ngx.DEBUG
 local ngx_ERR = ngx.ERR
 local ngx_var = ngx.var
 local ngx_print = ngx.print
+local ngx_header = ngx.header
 local co_yield = coroutine.yield
 local co_create = coroutine.create
 local co_status = coroutine.status
@@ -72,6 +74,25 @@ local co_wrap = function(func)
             end
         end
     end
+end
+
+
+-- Returns a new table, recursively copied from the one given.
+--
+-- @param   table   table to be copied
+-- @return  table
+local function tbl_copy(orig)
+    local orig_type = type(orig)
+    local copy
+    if orig_type == "table" then
+        copy = {}
+        for orig_key, orig_value in next, orig, nil do
+            copy[tbl_copy(orig_key)] = tbl_copy(orig_value)
+        end
+    else -- number, string, boolean, etc
+        copy = orig
+    end
+    return copy
 end
 
 
@@ -229,7 +250,7 @@ function _M.parse_uri(self, uri, query_in_path)
         -- If the URI is schemaless (i.e. //example.com) try to use our current
         -- request scheme.
         if not m[1] then
-            local scheme = ngx.var.scheme
+            local scheme = ngx_var.scheme
             if scheme == "http" or scheme == "https" then
                 m[1] = scheme
             else
@@ -733,7 +754,7 @@ end
 
 
 function _M.request(self, params)
-    
+    params = tbl_copy(params)  -- Take by value
     local res, err = self:send_request(params)
     if not res then
         return res, err
@@ -744,6 +765,8 @@ end
 
 
 function _M.request_pipeline(self, requests)
+    requests = tbl_copy(requests)  -- Take by value
+
     for _, params in ipairs(requests) do
         if params.headers and params.headers["Expect"] == "100-continue" then
             return nil, "Cannot pipeline request specifying Expect: 100-continue"
@@ -786,7 +809,7 @@ end
 
 
 function _M.request_uri(self, uri, params)
-    if not params then params = {} end
+    params = tbl_copy(params or {})  -- Take by value
 
     local parsed_uri, err = self:parse_uri(uri, false)
     if not parsed_uri then
@@ -886,9 +909,11 @@ end
 
 function _M.proxy_response(self, response, chunksize)
 
+    local proxy_error
+
     if not response then
---        ngx_log(ngx_ERR, "no response provided")
---        ngx.exit(ngx.HTTP_CLOSE)
+        ngx_log(ngx_ERR, "no response provided")
+        ngx.exit(ngx.HTTP_CLOSE)
         return
     end
 
@@ -897,7 +922,7 @@ function _M.proxy_response(self, response, chunksize)
     -- Filter out hop-by-hop headeres
     for k,v in pairs(response.headers) do
         if not HOP_BY_HOP_HEADERS[str_lower(k)] then
-            ngx.header[k] = v            
+            ngx_header[k] = v
         end
     end
     
@@ -906,6 +931,7 @@ function _M.proxy_response(self, response, chunksize)
         local chunk, err = reader(chunksize)
         if err then
             ngx_log(ngx_ERR, err)
+            proxy_error=err
             break
         end
 
@@ -913,11 +939,12 @@ function _M.proxy_response(self, response, chunksize)
             local res, err = ngx_print(chunk)
             if not res then
                 ngx_log(ngx_ERR, err)
+                proxy_error=err
                 break
             end
         end
     until not chunk
-    
+    return proxy_error
 end
 
 
